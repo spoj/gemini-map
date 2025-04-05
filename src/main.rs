@@ -111,16 +111,19 @@ struct Args {
     #[arg(short, long)]
     model: Option<String>,
 
-    /// The maximum number of inputs to process concurrently.
+    /// The maximum number of LLM requests or output operations to process concurrently.
     #[arg(short, long, default_value_t = 5)]
     concurrency: usize,
 
+    /// The maximum number of URLs to fetch concurrently.
+    #[arg(short = 'C', long, default_value_t = 1)]
+    fetch_concurrency: usize,
     /// Number of times to repeat the prompt for each input unit.
     #[arg(short, long, default_value_t = 1)]
     repeats: usize,
 
-    /// List of input files or URLs. Optional if --prompt is provided.
-    inputs: Vec<String>,
+    /// List of input files or URLs. If omitted, reads from stdin.
+    inputs: Option<Vec<String>>,
 
     /// Split PDF files into individual pages (rendered as PNGs) instead of processing the whole file. Requires PDFium library.
     #[arg(short, long, default_value_t = false)]
@@ -437,7 +440,7 @@ async fn gather_input_units(
     inputs: &[String],
     client: &ReqwestClient,
     split_pdf: bool,
-    concurrency: usize, // Added concurrency parameter
+    fetch_concurrency: usize, // Use specific fetch concurrency
 ) -> Result<Vec<InputUnit>> {
     // Use a stream to process inputs concurrently
     let units_stream = stream::iter(inputs)
@@ -458,7 +461,7 @@ async fn gather_input_units(
                 }
             }
         })
-        .buffer_unordered(concurrency); // Process concurrently based on the provided limit
+        .buffer_unordered(fetch_concurrency); // Process fetches concurrently
 
     // Collect all the Vec<InputUnit> results and flatten them
     let all_results: Vec<Result<Vec<InputUnit>>> = units_stream.collect().await;
@@ -573,33 +576,66 @@ async fn main() -> Result<()> {
         eprintln!("No model specified. Will output file content directly.");
     }
 
-    let work_items: Vec<WorkItem> = if args.inputs.is_empty() {
-        match (&args.prompt, &final_model_name) {
-            (Some(_), Some(_)) => {
-                eprintln!(
-                    "Preparing prompt-only processing for {} repetitions...",
-                    args.repeats
-                );
-                (0..args.repeats).map(|_| WorkItem::ProcessPrompt).collect()
-            }
-            _ => {
-                eprintln!(
-                    "Error: --prompt and --model are required when no input files/URLs are provided."
-                );
-                return Ok(());
+    // Determine input units: read from stdin or gather from files/URLs
+    let input_units: Vec<InputUnit> = match args.inputs {
+        None => {
+            eprintln!("No input files provided. Reading from stdin...");
+            use tokio::io::AsyncReadExt;
+            let mut stdin_data = Vec::new();
+            // It's okay if stdin is empty, we handle that later.
+            let read_result = tokio::io::stdin().read_to_end(&mut stdin_data).await;
+            match read_result {
+                Ok(0) => {
+                    eprintln!("Stdin is empty.");
+                    Vec::new() // Return empty vec if stdin is empty
+                }
+                Ok(_) => {
+                    // Assume text/plain for stdin for now. A flag could make this configurable.
+                    vec![InputUnit {
+                        identifier: "stdin".to_string(),
+                        data: stdin_data,
+                        mime_type: mime::TEXT_PLAIN_UTF_8, // Defaulting to text/plain; might need adjustment
+                    }]
+                }
+                Err(e) => {
+                    bail!("Failed to read from stdin: {}", e);
+                }
             }
         }
-    } else {
-        eprintln!("Gathering input units...");
-        let input_units =
-            gather_input_units(&args.inputs, &http_client, args.split_pdf, args.concurrency)
-                .await?;
-        if input_units.is_empty() {
-            eprintln!("No valid inputs found or read from the provided list.");
-            return Ok(());
+        Some(ref inputs) if inputs.is_empty() => {
+            // This case should ideally not happen with clap parsing Option<Vec<String>>
+            // but handle it defensively. Treat as no inputs provided.
+            eprintln!("Input list provided but is empty. Reading from stdin...");
+            use tokio::io::AsyncReadExt;
+            let mut stdin_data = Vec::new();
+            let read_result = tokio::io::stdin().read_to_end(&mut stdin_data).await;
+            match read_result {
+                Ok(0) => {
+                    eprintln!("Stdin is empty.");
+                    Vec::new()
+                }
+                Ok(_) => {
+                    vec![InputUnit {
+                        identifier: "stdin".to_string(),
+                        data: stdin_data,
+                        mime_type: mime::TEXT_PLAIN_UTF_8,
+                    }]
+                }
+                Err(e) => {
+                    bail!("Failed to read from stdin: {}", e);
+                }
+            }
         }
+        Some(ref inputs) => {
+            eprintln!("Gathering input units from provided list...");
+            gather_input_units(inputs, &http_client, args.split_pdf, args.fetch_concurrency).await?
+        }
+    };
+
+    // Now create work items based on input_units or prompt-only
+    let work_items: Vec<WorkItem> = if !input_units.is_empty() {
         eprintln!(
-            "Preparing processing for {} input units, each repeated {} times...",
+            "Preparing processing for {} input unit(s), each repeated {} times...",
             input_units.len(),
             args.repeats
         );
@@ -607,6 +643,24 @@ async fn main() -> Result<()> {
             .into_iter()
             .flat_map(|unit| (0..args.repeats).map(move |_| WorkItem::ProcessInput(unit.clone())))
             .collect()
+    } else {
+        // No input units from files/URLs or stdin
+        match (&args.prompt, &final_model_name) {
+            (Some(_), Some(_)) => {
+                eprintln!(
+                    "No input data found. Processing prompt-only for {} repetitions...",
+                    args.repeats
+                );
+                (0..args.repeats).map(|_| WorkItem::ProcessPrompt).collect()
+            }
+            _ => {
+                // No inputs, no prompt+model -> nothing to do.
+                eprintln!(
+                    "No input data provided (files, URLs, or stdin) and no prompt+model specified. Nothing to do."
+                );
+                Vec::new() // No work items
+            }
+        }
     };
 
     if work_items.is_empty() {

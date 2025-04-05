@@ -453,8 +453,7 @@ async fn main() -> Result<()> {
     let processing_stream = stream::iter(tasks_to_process)
         .map(|(work_item, run_idx, total_runs)| {
             let output = Arc::clone(&output_mutex);
-            let _errors_flag_clone = Arc::clone(&has_errors); // Clone Arc for the flag (prefix with _ to silence warning)
-            let errors_flag = Arc::clone(&has_errors); // Clone Arc for the flag
+            let errors_flag_clone = Arc::clone(&has_errors); // Clone Arc for the flag to pass through stream
             let prompt_opt = args.prompt.clone();
             let current_model_name = final_model_name.clone();
             let temperature_opt = args.temperature; // Capture temperature
@@ -534,7 +533,7 @@ async fn main() -> Result<()> {
 
                 let final_result: Result<(String, String)> = result.map(|content| (result_identifier.clone(), content));
 
-                (result_identifier, final_result, output, _errors_flag_clone) // Return the flag clone
+                (result_identifier, final_result, output, errors_flag_clone) // Return the flag clone
             })
         })
         .buffer_unordered(args.concurrency);
@@ -542,7 +541,7 @@ async fn main() -> Result<()> {
     processing_stream
         .for_each(|res| async {
             match res {
-                Ok((_identifier, Ok((output_id, content)), output, _errors_flag)) => { // Receive flag, mark unused if needed
+                Ok((_identifier, Ok((output_id, content)), output, _errors_flag_clone)) => { // Receive flag clone, mark unused if needed
                     let mut locked_stdout = output.lock().await;
                     let output_string = format!(
                         "\n--- START OF: {} ---\n{}\n--- END OF: {} ---\n",

@@ -10,12 +10,14 @@ cargo run --package gemini-map -- \
     -m <model_name> \
     [-c <concurrency>] \
     [-s | --split-pdf] \
+    [-t <temperature>] \
     <file_or_url1> [<file_or_url2> ...]`
 
 # Example:
 cargo run --package gemini-map -- \
     -p "Summarize the key points in this document." \
     -m "gemini-pro" \
+    -t 0.7 \
     report.txt notes.md chapter1.txt
 
 # Example with custom concurrency:
@@ -48,7 +50,7 @@ cargo run --package gemini-map -- \
 cargo install --path crates/gemini-map
 
 # Then run the installed binary
-gemini-map -p <prompt> -m <model> [-s] <files_or_urls...>
+gemini-map -p <prompt> -m <model> [-s] [-t <temperature>] <files_or_urls...>
 ```
 
 ## Configuration

@@ -42,9 +42,17 @@ struct Content {
     role: String,
 }
 
+// Add this struct definition
+#[derive(Serialize, Debug, Clone)]
+struct GenerationConfig {
+    temperature: f32,
+}
+
 #[derive(Serialize)]
 struct GenerateContentRequest {
     contents: Vec<Content>,
+    #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
+    generation_config: Option<GenerationConfig>, // Add this field
 }
 
 #[derive(Deserialize, Debug)]
@@ -114,6 +122,10 @@ struct Args {
     /// Split PDF files into individual pages (rendered as PNGs) instead of processing the whole file. Requires PDFium library.
     #[arg(short, long, default_value_t = false)]
     split_pdf: bool,
+
+    /// Controls randomness: lower values are more deterministic, higher values more creative. Optional.
+    #[arg(short, long)]
+    temperature: Option<f32>,
 }
 
 /// Fetches content from a URL and creates an InputUnit.
@@ -439,6 +451,7 @@ async fn main() -> Result<()> {
             let output = Arc::clone(&output_mutex);
             let prompt_opt = args.prompt.clone();
             let current_model_name = final_model_name.clone();
+            let temperature_opt = args.temperature; // Capture temperature
 
             let client_opt = http_client_arc.clone();
             let api_key_opt = api_key_arc.clone();
@@ -466,8 +479,11 @@ async fn main() -> Result<()> {
                                 };
                                 parts.push(Part { text: None, inline_data: Some(inline_data) });
 
+                                let generation_config = temperature_opt.map(|temp| GenerationConfig { temperature: temp });
+
                                 let request_body = GenerateContentRequest {
                                     contents: vec![Content { parts, role: "user".to_string() }],
+                                    generation_config,
                                 };
 
                                 call_gemini_api(client, api_key, base_url, &model_name, &request_body).await
@@ -495,11 +511,14 @@ async fn main() -> Result<()> {
                         let api_key = api_key_opt.as_ref().expect("API key should be initialized for prompt");
                         let base_url = base_url_opt.as_ref().expect("Base URL should be initialized for prompt");
 
+                        let generation_config = temperature_opt.map(|temp| GenerationConfig { temperature: temp });
+
                         let request_body = GenerateContentRequest {
                             contents: vec![Content {
                                 parts: vec![Part { text: Some(prompt), inline_data: None }],
                                 role: "user".to_string(),
                             }],
+                            generation_config, // Add this line
                         };
 
                         let res = call_gemini_api(client, api_key, base_url, &model_name, &request_body).await;

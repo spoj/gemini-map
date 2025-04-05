@@ -33,7 +33,7 @@ cargo run --package gemini-map -- \
     https://example.com/some/webpage.html
 ```
 
-# Example splitting a PDF into pages (requires PDFium library):
+# Example splitting a PDF into individual pages:
 cargo run --package gemini-map -- \
     -p "Describe the content of this page." \
     -m "gemini-pro-vision" \
@@ -61,9 +61,7 @@ export GEMINI_API_KEY="YOUR_API_KEY_HERE"
 
 ### PDF Splitting (`--split-pdf`)
 
-Using the `-s` or `--split-pdf` flag requires the **PDFium library** to be installed on your system. This flag renders each page of a PDF input into a PNG image, which is then processed individually. If the flag is not used, or if the PDFium library cannot be initialized, the entire PDF file is processed as a single binary blob (`application/pdf`).
-
-Please refer to the [`pdfium-render` crate documentation](https://crates.io/crates/pdfium-render) for instructions on installing the PDFium library for your operating system.
+Using the `-s` or `--split-pdf` flag processes each page of a PDF input individually. It uses the `lopdf` crate to extract each page into a separate, single-page PDF document in memory before sending it for processing. If the flag is not used, the entire PDF file is processed as a single binary blob (`application/pdf`). This feature does **not** require any external libraries like PDFium.
 
 ## Development
 

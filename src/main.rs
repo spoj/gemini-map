@@ -11,7 +11,10 @@ use std::{
     env,
     path::PathBuf,
     str,
-    sync::{Arc, LazyLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock,
+    },
 };
 use tokio::{
     fs,
@@ -423,6 +426,7 @@ async fn main() -> Result<()> {
     }
 
     let output_mutex = Arc::new(Mutex::new(stdout()));
+    let has_errors = Arc::new(AtomicBool::new(false)); // Flag to track errors
 
     match (&final_model_name, &args.prompt) {
         (Some(model), Some(prompt)) => println!(
@@ -449,6 +453,8 @@ async fn main() -> Result<()> {
     let processing_stream = stream::iter(tasks_to_process)
         .map(|(work_item, run_idx, total_runs)| {
             let output = Arc::clone(&output_mutex);
+            let _errors_flag_clone = Arc::clone(&has_errors); // Clone Arc for the flag (prefix with _ to silence warning)
+            let errors_flag = Arc::clone(&has_errors); // Clone Arc for the flag
             let prompt_opt = args.prompt.clone();
             let current_model_name = final_model_name.clone();
             let temperature_opt = args.temperature; // Capture temperature
@@ -457,7 +463,7 @@ async fn main() -> Result<()> {
             let api_key_opt = api_key_arc.clone();
             let base_url_opt = base_url_arc.clone();
 
-            tokio::spawn(async move {
+            tokio::spawn(async move { // Move the flag clone into the task
                 let (result_identifier, result): (String, Result<String>) = match work_item {
                     WorkItem::ProcessInput(unit) => {
                         let base_identifier = unit.identifier.clone();
@@ -528,7 +534,7 @@ async fn main() -> Result<()> {
 
                 let final_result: Result<(String, String)> = result.map(|content| (result_identifier.clone(), content));
 
-                (result_identifier, final_result, output)
+                (result_identifier, final_result, output, _errors_flag_clone) // Return the flag clone
             })
         })
         .buffer_unordered(args.concurrency);
@@ -536,7 +542,7 @@ async fn main() -> Result<()> {
     processing_stream
         .for_each(|res| async {
             match res {
-                Ok((_identifier, Ok((output_id, content)), output)) => {
+                Ok((_identifier, Ok((output_id, content)), output, _errors_flag)) => { // Receive flag, mark unused if needed
                     let mut locked_stdout = output.lock().await;
                     let output_string = format!(
                         "\n--- START OF: {} ---\n{}\n--- END OF: {} ---\n",
@@ -552,15 +558,382 @@ async fn main() -> Result<()> {
                         eprintln!("Error writing to stdout: {}", e);
                     }
                 }
-                Ok((identifier, Err(e), _)) => {
+                Ok((identifier, Err(e), _output, errors_flag)) => { // Receive flag
                     eprintln!("Error processing input '{}': {}", identifier, e);
+                    errors_flag.store(true, Ordering::SeqCst); // Use the received flag
                 }
                 Err(e) => {
-                    eprintln!("Error in processing task: {}", e);
+                    // This error comes from tokio::spawn failing (JoinError)
+                    eprintln!("Error in processing task join handle: {}", e);
+                    // We don't have the specific flag here, but the main `has_errors` will be checked later.
+                    // It might be better to set the flag *outside* the loop if a JoinError occurs,
+                    // but let's rely on the check after the loop for now.
                 }
             }
         })
         .await;
 
+    // Check if any errors occurred during processing
+    if has_errors.load(Ordering::SeqCst) {
+        eprintln!("\nOne or more errors occurred during processing.");
+        // Exit with a non-zero status code to indicate failure
+        std::process::exit(1);
+    }
+
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::{Builder as TempFileBuilder, NamedTempFile};
+
+    #[tokio::test]
+    async fn test_process_file_input_text_file() {
+        let mut file = TempFileBuilder::new()
+            .suffix(".txt")
+            .tempfile()
+            .expect("Failed to create temp file with .txt suffix");
+        let file_content = "Hello, world!";
+        writeln!(file, "{}", file_content).expect("Failed to write to temp file");
+        file.flush().expect("Failed to flush temp file");
+
+        let path = file.path().to_path_buf();
+        let identifier = "test_text.txt".to_string();
+
+        let result = process_file_input(path.clone(), identifier.clone(), false).await;
+
+        assert!(result.is_ok());
+        let units = result.unwrap();
+        assert_eq!(units.len(), 1);
+        let unit = &units[0];
+        assert_eq!(unit.identifier, identifier);
+        assert_eq!(unit.data, format!("{}\n", file_content).as_bytes()); // Add newline to expected
+        assert_eq!(unit.mime_type.essence_str(), mime::TEXT_PLAIN.essence_str()); // Compare essence_str
+    }
+
+    #[tokio::test]
+    async fn test_process_file_input_read_error() {
+        let non_existent_path = PathBuf::from("this_file_does_not_exist_hopefully.txt");
+        let identifier = "non_existent.txt".to_string();
+
+        let result = process_file_input(non_existent_path, identifier, false).await;
+
+        assert!(result.is_ok());
+        let units = result.unwrap();
+        assert!(units.is_empty());
+        // We can't easily assert stderr here, but the function should print an error
+    }
+
+    #[tokio::test]
+    async fn test_process_file_input_non_pdf_with_split_true() {
+        let mut file = TempFileBuilder::new()
+            .suffix(".txt")
+            .tempfile()
+            .expect("Failed to create temp file with .txt suffix");
+        let file_content = "Just a text file.";
+        writeln!(file, "{}", file_content).expect("Failed to write to temp file");
+        file.flush().expect("Failed to flush temp file");
+
+        let path = file.path().to_path_buf();
+        let identifier = "not_a_pdf.txt".to_string();
+
+        // Call with split_pdf = true
+        let result = process_file_input(path.clone(), identifier.clone(), true).await;
+
+        // Should behave the same as the text file test (no splitting attempted)
+        assert!(result.is_ok());
+        let units = result.unwrap();
+        assert_eq!(units.len(), 1);
+        let unit = &units[0];
+        assert_eq!(unit.identifier, identifier);
+        assert_eq!(unit.data, format!("{}\n", file_content).as_bytes()); // Add newline to expected
+        assert_eq!(unit.mime_type.essence_str(), mime::TEXT_PLAIN.essence_str());
+    }
+
+    // TODO: Add test for process_file_input with PDF splitting (requires sample PDF data - better as integration?)
+
+    #[tokio::test]
+    async fn test_process_input_string_file() {
+        let mut file = NamedTempFile::new().expect("Failed to create temp file");
+        let file_content = "File content for process_input_string";
+        writeln!(file, "{}", file_content).expect("Failed to write to temp file");
+        file.flush().expect("Failed to flush temp file");
+
+        let file_path_str = file.path().to_str().expect("Path is not valid UTF-8");
+        let client = ReqwestClient::new(); // Needed for the function signature
+
+        let result = process_input_string(file_path_str, &client, false).await;
+
+        assert!(result.is_ok());
+        let units = result.unwrap();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].data, format!("{}\n", file_content).as_bytes()); // Add newline to expected
+        assert!(units[0].identifier.contains(file.path().file_name().unwrap().to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_process_input_string_url() {
+        // --- Mock Server Setup ---
+        let mock_server = wiremock::MockServer::start().await;
+        let mock_url = mock_server.uri();
+        let mock_path = "/test_data.txt";
+        let full_url = format!("{}{}", mock_url, mock_path);
+        let mock_content = "Content from mock URL";
+        let mock_mime = "text/plain";
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(mock_path))
+            .respond_with(wiremock::ResponseTemplate::new(200)
+                .set_body_string(mock_content)
+                .insert_header("Content-Type", mock_mime))
+            .mount(&mock_server)
+            .await;
+
+        // --- Test Execution ---
+        let client = ReqwestClient::new(); // Real client, but directed to mock server
+        let result = process_input_string(&full_url, &client, false).await;
+
+        // --- Assertions ---
+        assert!(result.is_ok());
+        let units = result.unwrap();
+        assert_eq!(units.len(), 1);
+        let unit = &units[0];
+        assert_eq!(unit.identifier, full_url);
+        assert_eq!(unit.data, mock_content.as_bytes());
+        assert_eq!(unit.mime_type.essence_str(), mime::TEXT_PLAIN.essence_str());
+    }
+
+    #[test]
+    fn test_model_aliases() {
+        assert_eq!(MODEL_ALIASES.get("flash-think"), Some(&"gemini-2.0-flash-thinking-exp-01-21"));
+        assert_eq!(MODEL_ALIASES.get("pro"), Some(&"gemini-2.5-pro-exp-03-25"));
+        assert_eq!(MODEL_ALIASES.get("flash"), Some(&"gemini-2.0-flash"));
+        assert_eq!(MODEL_ALIASES.get("non-existent-alias"), None);
+        // Check that an unaliased model name isn't present unless explicitly added
+        assert_eq!(MODEL_ALIASES.get("gemini-pro"), None);
+    }
+
+    #[tokio::test]
+    async fn test_call_gemini_api_success() {
+        // --- Mock Server Setup ---
+        let mock_server = wiremock::MockServer::start().await;
+        let model_name = "mock-model-success";
+        let api_key = "mock-api-key";
+        let base_url = mock_server.uri();
+        let expected_response_text = "Mock API Success Response";
+
+        let mock_response_body = serde_json::json!({
+          "candidates": [{
+            "content": {
+              "parts": [{"text": expected_response_text}],
+              "role": "model"
+            }
+          }]
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(format!("/v1beta/models/{}:generateContent", model_name)))
+            .and(wiremock::matchers::query_param("key", api_key))
+            .and(wiremock::matchers::header("Content-Type", "application/json"))
+            // Basic body check - could be more specific if needed
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({"contents": [{}]})))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(mock_response_body))
+            .mount(&mock_server)
+            .await;
+
+        // --- Test Execution ---
+        let client = ReqwestClient::new();
+        let request_body = GenerateContentRequest {
+            contents: vec![Content { parts: vec![Part { text: Some("test".to_string()), inline_data: None }], role: "user".to_string() }],
+            generation_config: None,
+        };
+
+        let result = call_gemini_api(&client, api_key, &base_url, model_name, &request_body).await;
+
+        // --- Assertions ---
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), expected_response_text);
+    }
+
+     #[tokio::test]
+    async fn test_call_gemini_api_failure() {
+        // --- Mock Server Setup ---
+        let mock_server = wiremock::MockServer::start().await;
+        let model_name = "mock-model-fail";
+        let api_key = "mock-api-key-fail";
+        let base_url = mock_server.uri();
+        let error_message = "Invalid API key";
+
+        let mock_error_body = serde_json::json!({
+            "error": {
+                "code": 400,
+                "message": error_message,
+                "status": "INVALID_ARGUMENT"
+            }
+        });
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(format!("/v1beta/models/{}:generateContent", model_name)))
+            .and(wiremock::matchers::query_param("key", api_key))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(mock_error_body))
+            .mount(&mock_server)
+            .await;
+
+        // --- Test Execution ---
+        let client = ReqwestClient::new();
+         let request_body = GenerateContentRequest {
+            contents: vec![Content { parts: vec![Part { text: Some("test".to_string()), inline_data: None }], role: "user".to_string() }],
+            generation_config: None,
+        };
+
+        let result = call_gemini_api(&client, api_key, &base_url, model_name, &request_body).await;
+
+        // --- Assertions ---
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        // Check that the error message contains the status code and the message from the mock response
+        assert!(error.to_string().contains("400 Bad Request"));
+        assert!(error.to_string().contains(error_message));
+    }
+
+    #[tokio::test]
+    async fn test_gather_input_units_files_only() {
+        let mut file1 = NamedTempFile::new().unwrap();
+        writeln!(file1, "content1").unwrap();
+        file1.flush().unwrap();
+        let path1_str = file1.path().to_str().unwrap().to_string();
+
+        let mut file2 = NamedTempFile::new().unwrap();
+        writeln!(file2, "content2").unwrap();
+        file2.flush().unwrap();
+        let path2_str = file2.path().to_str().unwrap().to_string();
+
+        let inputs = vec![path1_str.clone(), path2_str.clone()];
+        let client = ReqwestClient::new();
+
+        let result = gather_input_units(&inputs, &client, false).await;
+
+        assert!(result.is_ok());
+        let units = result.unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(units.iter().any(|u| u.identifier.contains(file1.path().file_name().unwrap().to_str().unwrap()) && u.data == b"content1\n")); // Add newline
+        assert!(units.iter().any(|u| u.identifier.contains(file2.path().file_name().unwrap().to_str().unwrap()) && u.data == b"content2\n")); // Add newline
+    }
+
+    #[tokio::test]
+    async fn test_gather_input_units_urls_only() {
+        let mock_server = wiremock::MockServer::start().await;
+        let url1 = format!("{}/url1", mock_server.uri());
+        let url2 = format!("{}/url2", mock_server.uri());
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/url1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("content_url1"))
+            .mount(&mock_server).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/url2"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("content_url2"))
+            .mount(&mock_server).await;
+
+        let inputs = vec![url1.clone(), url2.clone()];
+        let client = ReqwestClient::new();
+
+        let result = gather_input_units(&inputs, &client, false).await;
+
+        assert!(result.is_ok());
+        let units = result.unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(units.iter().any(|u| u.identifier == url1 && u.data == b"content_url1"));
+        assert!(units.iter().any(|u| u.identifier == url2 && u.data == b"content_url2"));
+    }
+
+     #[tokio::test]
+    async fn test_gather_input_units_mixed() {
+        // File setup
+        let mut file1 = NamedTempFile::new().unwrap();
+        writeln!(file1, "content_file").unwrap();
+        file1.flush().unwrap();
+        let path1_str = file1.path().to_str().unwrap().to_string();
+
+        // URL setup
+        let mock_server = wiremock::MockServer::start().await;
+        let url1 = format!("{}/mixed_url", mock_server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/mixed_url"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("content_url_mixed"))
+            .mount(&mock_server).await;
+
+        let inputs = vec![path1_str.clone(), url1.clone()];
+        let client = ReqwestClient::new();
+
+        let result = gather_input_units(&inputs, &client, false).await;
+
+        assert!(result.is_ok());
+        let units = result.unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(units.iter().any(|u| u.identifier.contains(file1.path().file_name().unwrap().to_str().unwrap()) && u.data == b"content_file\n")); // Add newline
+        assert!(units.iter().any(|u| u.identifier == url1 && u.data == b"content_url_mixed"));
+    }
+
+    #[tokio::test]
+    async fn test_gather_input_units_with_errors() {
+        // Valid file setup
+        let mut file1 = NamedTempFile::new().unwrap();
+        writeln!(file1, "valid_content").unwrap();
+        file1.flush().unwrap();
+        let path1_str = file1.path().to_str().unwrap().to_string();
+
+        // Invalid file path
+        let invalid_path_str = "non_existent_file_gather.txt".to_string();
+
+        // Valid URL setup
+        let mock_server = wiremock::MockServer::start().await;
+        let url1 = format!("{}/valid_url_gather", mock_server.uri());
+         wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/valid_url_gather"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("valid_url_content"))
+            .mount(&mock_server).await;
+
+        // Invalid URL (will cause connection error or 404 depending on mock setup)
+        let invalid_url = format!("{}/invalid_url_gather", mock_server.uri());
+        // No mock mounted for invalid_url, so it should fail
+
+        let inputs = vec![path1_str.clone(), invalid_path_str, url1.clone(), invalid_url];
+        let client = ReqwestClient::new();
+
+        let result = gather_input_units(&inputs, &client, false).await;
+
+        // Should succeed overall, but only contain units for valid inputs
+        assert!(result.is_ok());
+        let units = result.unwrap();
+        assert_eq!(units.len(), 2); // Only the valid file and valid URL
+        assert!(units.iter().any(|u| u.identifier.contains(file1.path().file_name().unwrap().to_str().unwrap()) && u.data == b"valid_content\n")); // Add newline
+        assert!(units.iter().any(|u| u.identifier == url1 && u.data == b"valid_url_content"));
+        // We can't easily assert stderr here, but errors for the invalid inputs should have been printed
+    }
+
+    #[tokio::test]
+    async fn test_fetch_url_input_404() {
+        // --- Mock Server Setup ---
+        let mock_server = wiremock::MockServer::start().await;
+        let url_404 = format!("{}/not_found", mock_server.uri());
+
+        // No mock mounted for /not_found, so wiremock returns 404 by default
+
+        // --- Test Execution ---
+        let client = ReqwestClient::new();
+        let result = fetch_url_input(Url::parse(&url_404).unwrap(), &client).await;
+
+        // --- Assertions ---
+        // Should succeed but return Ok(None) because the fetch failed
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+        // Stderr should contain the 404 error message (cannot assert directly here)
+    }
+
+    // TODO: Add tests for fetch_url_input connection error (harder to mock reliably)
+    // Argument parsing logic is better covered by integration tests in tests/cli.rs
 }

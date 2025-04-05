@@ -168,12 +168,15 @@ fn split_pdf_lopdf(data: &[u8], identifier: &str) -> Result<Vec<InputUnit>> {
     let temp_doc = Document::load_mem(data).context("Failed to load PDF data to get page count")?;
     let page_count = temp_doc.get_pages().len();
     if page_count == 0 {
-         eprintln!("Warning: PDF '{}' has no pages.", identifier);
-         return Ok(page_units);
+        eprintln!("Warning: PDF '{}' has no pages.", identifier);
+        return Ok(page_units);
     }
     drop(temp_doc);
 
-    eprintln!("Splitting PDF with pdf_utils: {} ({} pages)", identifier, page_count);
+    eprintln!(
+        "Splitting PDF with pdf_utils: {} ({} pages)",
+        identifier, page_count
+    );
 
     // Iterate from 1 to page_count (inclusive) as extract_page_from_pdf expects 1-based index
     for page_num_u32 in 1..=(page_count as u32) {
@@ -183,19 +186,6 @@ fn split_pdf_lopdf(data: &[u8], identifier: &str) -> Result<Vec<InputUnit>> {
 
         match pdf_utils::extract_page_from_pdf(data, page_num_u32) {
             Ok(page_data) => {
-                // Save a copy to /tmp
-                let tmp_filename = format!("/tmp/testing-page-{}.pdf", page_num);
-                // Use a clone for saving to tmp, as page_data is moved into InputUnit
-                let tmp_data = page_data.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = tokio::fs::write(&tmp_filename, &tmp_data).await {
-                        eprintln!("Warning: Failed to write temporary file {}: {}", tmp_filename, e);
-                    } else {
-                        eprintln!("Saved temporary file: {}", tmp_filename);
-                    }
-                });
-
-
                 page_units.push(InputUnit {
                     identifier: page_identifier,
                     data: page_data,
@@ -203,7 +193,6 @@ fn split_pdf_lopdf(data: &[u8], identifier: &str) -> Result<Vec<InputUnit>> {
                 });
             }
             Err(e) => {
-                // Log the error
                 eprintln!(
                     "Error extracting page {} of '{}': {:?}",
                     page_num, identifier, e

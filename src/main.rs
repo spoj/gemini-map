@@ -1,5 +1,5 @@
-use anyhow::{anyhow, bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
 // Only Document is used directly in this file now
@@ -12,13 +12,13 @@ use std::{
     path::PathBuf,
     str,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
     },
 };
 use tokio::{
     fs,
-    io::{stdout, AsyncWriteExt},
+    io::{AsyncWriteExt, stdout},
     sync::Mutex,
 };
 use url::Url;
@@ -269,22 +269,207 @@ async fn process_input_string(
         }
     }
 }
+
+// Processor struct to hold context for processing work items
+#[derive(Clone)] // Clone is cheap due to Arcs
+struct WorkItemProcessor {
+    client: Option<Arc<ReqwestClient>>,
+    api_key: Option<Arc<String>>,
+    base_url: Option<Arc<String>>,
+    model_name: Option<String>,
+    prompt: Option<String>,
+    temperature: Option<f32>,
+}
+
+impl WorkItemProcessor {
+    /// Creates a new WorkItemProcessor with the necessary context.
+    fn new(
+        client: Option<Arc<ReqwestClient>>,
+        api_key: Option<Arc<String>>,
+        base_url: Option<Arc<String>>,
+        model_name: Option<String>,
+        prompt: Option<String>,
+        temperature: Option<f32>,
+    ) -> Self {
+        Self {
+            client,
+            api_key,
+            base_url,
+            model_name,
+            prompt,
+            temperature,
+        }
+    }
+
+    /// Processes a single work item using the stored context.
+    async fn process(
+        &self,               // Takes self by reference
+        work_item: WorkItem, // Takes ownership of the WorkItem
+        run_idx: usize,
+        total_runs: usize,
+    ) -> Result<(String, String), (String, anyhow::Error)> {
+        // Returns Ok((id, content)) or Err((id, error))
+        match work_item {
+            WorkItem::ProcessInput(unit) => {
+                let base_identifier = unit.identifier.clone();
+                let identifier =
+                    format!("{} (run {}/{})", base_identifier, run_idx + 1, total_runs);
+
+                let res = match &self.model_name {
+                    Some(model_name) => {
+                        // Use context from self
+                        let client = self
+                            .client
+                            .as_ref()
+                            .expect("API client should be initialized");
+                        let api_key = self
+                            .api_key
+                            .as_ref()
+                            .expect("API key should be initialized");
+                        let base_url = self
+                            .base_url
+                            .as_ref()
+                            .expect("Base URL should be initialized");
+
+                        let mut parts = Vec::new();
+                        if let Some(prompt) = &self.prompt {
+                            parts.push(Part {
+                                text: Some(prompt.clone()),
+                                inline_data: None,
+                            });
+                        }
+                        let inline_data = InlineData {
+                            mime_type: unit.mime_type.to_string(),
+                            data: BASE64_STANDARD.encode(&unit.data),
+                        };
+                        parts.push(Part {
+                            text: None,
+                            inline_data: Some(inline_data),
+                        });
+
+                        let generation_config = self
+                            .temperature
+                            .map(|temp| GenerationConfig { temperature: temp });
+
+                        let request_body = GenerateContentRequest {
+                            contents: vec![Content {
+                                parts,
+                                role: "user".to_string(),
+                            }],
+                            generation_config,
+                        };
+
+                        call_gemini_api(client, api_key, base_url, model_name, &request_body).await
+                    }
+                    None => {
+                        // Handle direct output when no model is specified
+                        if unit.mime_type.type_() == mime::TEXT {
+                            String::from_utf8(unit.data).map_err(|e| {
+                                anyhow!("Input '{}' is not valid UTF-8: {}", base_identifier, e)
+                            })
+                        } else {
+                            Err(anyhow!(
+                                "Cannot output binary input content ({}) for '{}' when no model is specified.",
+                                unit.mime_type,
+                                base_identifier
+                            ))
+                        }
+                    }
+                };
+                match res {
+                    Ok(content) => Ok((identifier, content)),
+                    Err(e) => Err((identifier, e)),
+                }
+            }
+            WorkItem::ProcessPrompt => {
+                let identifier = format!("Prompt (run {}/{})", run_idx + 1, total_runs);
+                let model_name = self
+                    .model_name
+                    .as_ref()
+                    .expect("Model name required for ProcessPrompt");
+                let prompt = self
+                    .prompt
+                    .as_ref()
+                    .expect("Prompt required for ProcessPrompt");
+
+                let client = self
+                    .client
+                    .as_ref()
+                    .expect("API client should be initialized");
+                let api_key = self
+                    .api_key
+                    .as_ref()
+                    .expect("API key should be initialized");
+                let base_url = self
+                    .base_url
+                    .as_ref()
+                    .expect("Base URL should be initialized");
+
+                let generation_config = self
+                    .temperature
+                    .map(|temp| GenerationConfig { temperature: temp });
+
+                let request_body = GenerateContentRequest {
+                    contents: vec![Content {
+                        parts: vec![Part {
+                            text: Some(prompt.clone()),
+                            inline_data: None,
+                        }],
+                        role: "user".to_string(),
+                    }],
+                    generation_config,
+                };
+
+                let res =
+                    call_gemini_api(client, api_key, base_url, model_name, &request_body).await;
+                match res {
+                    Ok(content) => Ok((identifier, content)),
+                    Err(e) => Err((identifier, e)),
+                }
+            }
+        }
+    }
+}
 // Removed section separator comment
 
-/// Gathers and prepares all input units from files and URLs.
+/// Gathers and prepares all input units from files and URLs concurrently.
 async fn gather_input_units(
     inputs: &[String],
     client: &ReqwestClient,
     split_pdf: bool,
+    concurrency: usize, // Added concurrency parameter
 ) -> Result<Vec<InputUnit>> {
-    let mut all_units = Vec::new();
+    // Use a stream to process inputs concurrently
+    let units_stream = stream::iter(inputs)
+        .map(|input_str| {
+            // Clone necessary items for the async operation
+            let client_clone = client.clone(); // ReqwestClient is cheap to clone (Arc internally)
+            let input_str_owned = input_str.to_string(); // Own the string
 
-    for input_str in inputs {
-        match process_input_string(input_str, client, split_pdf).await {
-            Ok(new_units) => all_units.extend(new_units), // Removed pdfium_opt
-            Err(e) => eprintln!("Error processing input '{}': {}", input_str, e),
-        }
-    }
+            async move {
+                // Call the processing function
+                match process_input_string(&input_str_owned, &client_clone, split_pdf).await {
+                    Ok(units) => Ok(units), // Keep the Vec<InputUnit>
+                    Err(e) => {
+                        // Log the error but return Ok(empty) to allow others to proceed
+                        eprintln!("Error processing input '{}': {}", input_str_owned, e);
+                        Ok(Vec::new())
+                    }
+                }
+            }
+        })
+        .buffer_unordered(concurrency); // Process concurrently based on the provided limit
+
+    // Collect all the Vec<InputUnit> results and flatten them
+    let all_results: Vec<Result<Vec<InputUnit>>> = units_stream.collect().await;
+
+    // Flatten the results, discarding errors after logging them above
+    let all_units: Vec<InputUnit> = all_results
+        .into_iter()
+        .filter_map(Result::ok) // Keep only Ok results
+        .flatten() // Flatten Vec<Vec<InputUnit>> into Vec<InputUnit>
+        .collect();
+
     Ok(all_units)
 }
 
@@ -398,13 +583,17 @@ async fn main() -> Result<()> {
                 (0..args.repeats).map(|_| WorkItem::ProcessPrompt).collect()
             }
             _ => {
-                eprintln!("Error: --prompt and --model are required when no input files/URLs are provided.");
+                eprintln!(
+                    "Error: --prompt and --model are required when no input files/URLs are provided."
+                );
                 return Ok(());
             }
         }
     } else {
         eprintln!("Gathering input units...");
-        let input_units = gather_input_units(&args.inputs, &http_client, args.split_pdf).await?;
+        let input_units =
+            gather_input_units(&args.inputs, &http_client, args.split_pdf, args.concurrency)
+                .await?;
         if input_units.is_empty() {
             eprintln!("No valid inputs found or read from the provided list.");
             return Ok(());
@@ -440,100 +629,33 @@ async fn main() -> Result<()> {
         (None, _) => println!("Below is the collated file content:"),
     }
 
+    // Create the processor instance with the shared context
+    let processor = WorkItemProcessor::new(
+        http_client_arc,  // Renamed from client_opt
+        api_key_arc,      // Renamed from api_key_opt
+        base_url_arc,     // Renamed from base_url_opt
+        final_model_name, // Renamed from current_model_name
+        args.prompt,
+        args.temperature,
+    );
+
     let total_runs = args.repeats;
-    let tasks_to_process = work_items
-        .into_iter()
-        .enumerate()
-        .map(|(idx, item)| {
+    let processing_stream = stream::iter(work_items.into_iter().enumerate()) // Iterate directly
+        .map(|(idx, work_item)| {
+            // Get index and work_item
             let run_idx = idx % total_runs;
-            (item, run_idx, total_runs)
-        })
-        .collect::<Vec<_>>();
-
-    let processing_stream = stream::iter(tasks_to_process)
-        .map(|(work_item, run_idx, total_runs)| {
+            let processor_clone = processor.clone(); // Clone processor for the task
             let output = Arc::clone(&output_mutex);
-            let errors_flag_clone = Arc::clone(&has_errors); // Clone Arc for the flag to pass through stream
-            let prompt_opt = args.prompt.clone();
-            let current_model_name = final_model_name.clone();
-            let temperature_opt = args.temperature; // Capture temperature
+            let errors_flag_clone = Arc::clone(&has_errors);
 
-            let client_opt = http_client_arc.clone();
-            let api_key_opt = api_key_arc.clone();
-            let base_url_opt = base_url_arc.clone();
+            tokio::spawn(async move {
+                // Call process on the cloned processor instance
+                let result: Result<(String, String), (String, anyhow::Error)> = processor_clone
+                    .process(work_item, run_idx, total_runs)
+                    .await;
 
-            tokio::spawn(async move { // Move the flag clone into the task
-                let (result_identifier, result): (String, Result<String>) = match work_item {
-                    WorkItem::ProcessInput(unit) => {
-                        let base_identifier = unit.identifier.clone();
-                        let identifier = format!("{} (run {}/{})", base_identifier, run_idx + 1, total_runs);
-
-                        let res = match current_model_name {
-                            Some(model_name) => {
-                                let client = client_opt.as_ref().expect("API client should be initialized for model");
-                                let api_key = api_key_opt.as_ref().expect("API key should be initialized for model");
-                                let base_url = base_url_opt.as_ref().expect("Base URL should be initialized for model");
-
-                                let mut parts = Vec::new();
-                                if let Some(prompt) = prompt_opt {
-                                    parts.push(Part { text: Some(prompt), inline_data: None });
-                                }
-                                let inline_data = InlineData {
-                                    mime_type: unit.mime_type.to_string(),
-                                    data: BASE64_STANDARD.encode(&unit.data),
-                                };
-                                parts.push(Part { text: None, inline_data: Some(inline_data) });
-
-                                let generation_config = temperature_opt.map(|temp| GenerationConfig { temperature: temp });
-
-                                let request_body = GenerateContentRequest {
-                                    contents: vec![Content { parts, role: "user".to_string() }],
-                                    generation_config,
-                                };
-
-                                call_gemini_api(client, api_key, base_url, &model_name, &request_body).await
-                            }
-                            None => {
-                                if unit.mime_type.type_() == mime::TEXT {
-                                    String::from_utf8(unit.data)
-                                        .map_err(|e| anyhow!("Input '{}' is not valid UTF-8: {}", base_identifier, e))
-                                } else {
-                                    Err(anyhow!(
-                                        "Cannot output binary input content ({}) for '{}' when no model is specified.",
-                                        unit.mime_type, base_identifier
-                                    ))
-                                }
-                            }
-                        };
-                        (identifier, res)
-                    }
-                    WorkItem::ProcessPrompt => {
-                        let identifier = format!("Prompt (run {}/{})", run_idx + 1, total_runs);
-                        let model_name = current_model_name.expect("Model name required for ProcessPrompt");
-                        let prompt = prompt_opt.expect("Prompt required for ProcessPrompt");
-
-                        let client = client_opt.as_ref().expect("API client should be initialized for prompt");
-                        let api_key = api_key_opt.as_ref().expect("API key should be initialized for prompt");
-                        let base_url = base_url_opt.as_ref().expect("Base URL should be initialized for prompt");
-
-                        let generation_config = temperature_opt.map(|temp| GenerationConfig { temperature: temp });
-
-                        let request_body = GenerateContentRequest {
-                            contents: vec![Content {
-                                parts: vec![Part { text: Some(prompt), inline_data: None }],
-                                role: "user".to_string(),
-                            }],
-                            generation_config, // Add this line
-                        };
-
-                        let res = call_gemini_api(client, api_key, base_url, &model_name, &request_body).await;
-                        (identifier, res)
-                    }
-                };
-
-                let final_result: Result<(String, String)> = result.map(|content| (result_identifier.clone(), content));
-
-                (result_identifier, final_result, output, errors_flag_clone) // Return the flag clone
+                // The result already contains the identifier in both Ok and Err variants.
+                (result, output, errors_flag_clone) // Return the result, output handle, and error flag
             })
         })
         .buffer_unordered(args.concurrency);
@@ -541,7 +663,9 @@ async fn main() -> Result<()> {
     processing_stream
         .for_each(|res| async {
             match res {
-                Ok((_identifier, Ok((output_id, content)), output, _errors_flag_clone)) => { // Receive flag clone, mark unused if needed
+                // res is JoinResult<(Result<(String, String), (String, anyhow::Error)>, Arc<Mutex<Stdout>>, Arc<AtomicBool>)>
+                // Task completed successfully, and processing within the task succeeded
+                Ok((Ok((output_id, content)), output, _errors_flag_clone)) => {
                     let mut locked_stdout = output.lock().await;
                     let output_string = format!(
                         "\n--- START OF: {} ---\n{}\n--- END OF: {} ---\n",
@@ -557,15 +681,21 @@ async fn main() -> Result<()> {
                         eprintln!("Error writing to stdout: {}", e);
                     }
                 }
-                Ok((identifier, Err(e), _output, errors_flag)) => { // Receive flag
-                    eprintln!("Error processing input '{}': {}", identifier, e);
-                    errors_flag.store(true, Ordering::SeqCst); // Use the received flag
+                // Task completed successfully, but processing within the task failed
+                Ok((Err((identifier, e)), _output, errors_flag)) => {
+                    // Use the identifier returned in the Err variant
+                    eprintln!("Error processing '{}': {}", identifier, e);
+                    errors_flag.store(true, Ordering::SeqCst);
                 }
+                // Task itself failed to complete (JoinError)
                 Err(e) => {
-                    // This error comes from tokio::spawn failing (JoinError)
                     eprintln!("Error in processing task join handle: {}", e);
-                    // We don't have the specific flag here, but the main `has_errors` will be checked later.
-                    // It might be better to set the flag *outside* the loop if a JoinError occurs,
+                    // Cannot reliably get the identifier here, but we need to flag that *an* error occurred.
+                    // The main `has_errors` flag needs to be accessed. This requires passing it back out
+                    // or setting it directly if we had access. Let's set it via the clone we have,
+                    // although this feels a bit indirect. A channel might be cleaner for reporting join errors.
+                    // For now, let's rely on the final check after the loop, as JoinErrors should be rare.
+                    // TODO: Consider setting the flag directly here if possible or using a channel.
                     // but let's rely on the check after the loop for now.
                 }
             }
@@ -581,7 +711,6 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -670,7 +799,11 @@ mod tests {
         let units = result.unwrap();
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].data, format!("{}\n", file_content).as_bytes()); // Add newline to expected
-        assert!(units[0].identifier.contains(file.path().file_name().unwrap().to_str().unwrap()));
+        assert!(
+            units[0]
+                .identifier
+                .contains(file.path().file_name().unwrap().to_str().unwrap())
+        );
     }
 
     #[tokio::test]
@@ -685,9 +818,11 @@ mod tests {
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(mock_path))
-            .respond_with(wiremock::ResponseTemplate::new(200)
-                .set_body_string(mock_content)
-                .insert_header("Content-Type", mock_mime))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(mock_content)
+                    .insert_header("Content-Type", mock_mime),
+            )
             .mount(&mock_server)
             .await;
 
@@ -707,7 +842,10 @@ mod tests {
 
     #[test]
     fn test_model_aliases() {
-        assert_eq!(MODEL_ALIASES.get("flash-think"), Some(&"gemini-2.0-flash-thinking-exp-01-21"));
+        assert_eq!(
+            MODEL_ALIASES.get("flash-think"),
+            Some(&"gemini-2.0-flash-thinking-exp-01-21")
+        );
         assert_eq!(MODEL_ALIASES.get("pro"), Some(&"gemini-2.5-pro-exp-03-25"));
         assert_eq!(MODEL_ALIASES.get("flash"), Some(&"gemini-2.0-flash"));
         assert_eq!(MODEL_ALIASES.get("non-existent-alias"), None);
@@ -734,11 +872,19 @@ mod tests {
         });
 
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path(format!("/v1beta/models/{}:generateContent", model_name)))
+            .and(wiremock::matchers::path(format!(
+                "/v1beta/models/{}:generateContent",
+                model_name
+            )))
             .and(wiremock::matchers::query_param("key", api_key))
-            .and(wiremock::matchers::header("Content-Type", "application/json"))
+            .and(wiremock::matchers::header(
+                "Content-Type",
+                "application/json",
+            ))
             // Basic body check - could be more specific if needed
-            .and(wiremock::matchers::body_partial_json(serde_json::json!({"contents": [{}]})))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"contents": [{}]}),
+            ))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(mock_response_body))
             .mount(&mock_server)
             .await;
@@ -746,7 +892,13 @@ mod tests {
         // --- Test Execution ---
         let client = ReqwestClient::new();
         let request_body = GenerateContentRequest {
-            contents: vec![Content { parts: vec![Part { text: Some("test".to_string()), inline_data: None }], role: "user".to_string() }],
+            contents: vec![Content {
+                parts: vec![Part {
+                    text: Some("test".to_string()),
+                    inline_data: None,
+                }],
+                role: "user".to_string(),
+            }],
             generation_config: None,
         };
 
@@ -757,7 +909,7 @@ mod tests {
         assert_eq!(result.unwrap(), expected_response_text);
     }
 
-     #[tokio::test]
+    #[tokio::test]
     async fn test_call_gemini_api_failure() {
         // --- Mock Server Setup ---
         let mock_server = wiremock::MockServer::start().await;
@@ -775,7 +927,10 @@ mod tests {
         });
 
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path(format!("/v1beta/models/{}:generateContent", model_name)))
+            .and(wiremock::matchers::path(format!(
+                "/v1beta/models/{}:generateContent",
+                model_name
+            )))
             .and(wiremock::matchers::query_param("key", api_key))
             .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(mock_error_body))
             .mount(&mock_server)
@@ -783,8 +938,14 @@ mod tests {
 
         // --- Test Execution ---
         let client = ReqwestClient::new();
-         let request_body = GenerateContentRequest {
-            contents: vec![Content { parts: vec![Part { text: Some("test".to_string()), inline_data: None }], role: "user".to_string() }],
+        let request_body = GenerateContentRequest {
+            contents: vec![Content {
+                parts: vec![Part {
+                    text: Some("test".to_string()),
+                    inline_data: None,
+                }],
+                role: "user".to_string(),
+            }],
             generation_config: None,
         };
 
@@ -813,13 +974,21 @@ mod tests {
         let inputs = vec![path1_str.clone(), path2_str.clone()];
         let client = ReqwestClient::new();
 
-        let result = gather_input_units(&inputs, &client, false).await;
+        let result = gather_input_units(&inputs, &client, false, 5).await; // Added concurrency (default 5)
 
         assert!(result.is_ok());
         let units = result.unwrap();
         assert_eq!(units.len(), 2);
-        assert!(units.iter().any(|u| u.identifier.contains(file1.path().file_name().unwrap().to_str().unwrap()) && u.data == b"content1\n")); // Add newline
-        assert!(units.iter().any(|u| u.identifier.contains(file2.path().file_name().unwrap().to_str().unwrap()) && u.data == b"content2\n")); // Add newline
+        assert!(units.iter().any(|u| {
+            u.identifier
+                .contains(file1.path().file_name().unwrap().to_str().unwrap())
+                && u.data == b"content1\n"
+        })); // Add newline
+        assert!(units.iter().any(|u| {
+            u.identifier
+                .contains(file2.path().file_name().unwrap().to_str().unwrap())
+                && u.data == b"content2\n"
+        })); // Add newline
     }
 
     #[tokio::test]
@@ -831,25 +1000,35 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/url1"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("content_url1"))
-            .mount(&mock_server).await;
+            .mount(&mock_server)
+            .await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/url2"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("content_url2"))
-            .mount(&mock_server).await;
+            .mount(&mock_server)
+            .await;
 
         let inputs = vec![url1.clone(), url2.clone()];
         let client = ReqwestClient::new();
 
-        let result = gather_input_units(&inputs, &client, false).await;
+        let result = gather_input_units(&inputs, &client, false, 5).await; // Added concurrency (default 5)
 
         assert!(result.is_ok());
         let units = result.unwrap();
         assert_eq!(units.len(), 2);
-        assert!(units.iter().any(|u| u.identifier == url1 && u.data == b"content_url1"));
-        assert!(units.iter().any(|u| u.identifier == url2 && u.data == b"content_url2"));
+        assert!(
+            units
+                .iter()
+                .any(|u| u.identifier == url1 && u.data == b"content_url1")
+        );
+        assert!(
+            units
+                .iter()
+                .any(|u| u.identifier == url2 && u.data == b"content_url2")
+        );
     }
 
-     #[tokio::test]
+    #[tokio::test]
     async fn test_gather_input_units_mixed() {
         // File setup
         let mut file1 = NamedTempFile::new().unwrap();
@@ -863,18 +1042,27 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/mixed_url"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("content_url_mixed"))
-            .mount(&mock_server).await;
+            .mount(&mock_server)
+            .await;
 
         let inputs = vec![path1_str.clone(), url1.clone()];
         let client = ReqwestClient::new();
 
-        let result = gather_input_units(&inputs, &client, false).await;
+        let result = gather_input_units(&inputs, &client, false, 5).await; // Added concurrency (default 5)
 
         assert!(result.is_ok());
         let units = result.unwrap();
         assert_eq!(units.len(), 2);
-        assert!(units.iter().any(|u| u.identifier.contains(file1.path().file_name().unwrap().to_str().unwrap()) && u.data == b"content_file\n")); // Add newline
-        assert!(units.iter().any(|u| u.identifier == url1 && u.data == b"content_url_mixed"));
+        assert!(units.iter().any(|u| {
+            u.identifier
+                .contains(file1.path().file_name().unwrap().to_str().unwrap())
+                && u.data == b"content_file\n"
+        })); // Add newline
+        assert!(
+            units
+                .iter()
+                .any(|u| u.identifier == url1 && u.data == b"content_url_mixed")
+        );
     }
 
     #[tokio::test]
@@ -891,26 +1079,40 @@ mod tests {
         // Valid URL setup
         let mock_server = wiremock::MockServer::start().await;
         let url1 = format!("{}/valid_url_gather", mock_server.uri());
-         wiremock::Mock::given(wiremock::matchers::method("GET"))
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/valid_url_gather"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("valid_url_content"))
-            .mount(&mock_server).await;
+            .mount(&mock_server)
+            .await;
 
         // Invalid URL (will cause connection error or 404 depending on mock setup)
         let invalid_url = format!("{}/invalid_url_gather", mock_server.uri());
         // No mock mounted for invalid_url, so it should fail
 
-        let inputs = vec![path1_str.clone(), invalid_path_str, url1.clone(), invalid_url];
+        let inputs = vec![
+            path1_str.clone(),
+            invalid_path_str,
+            url1.clone(),
+            invalid_url,
+        ];
         let client = ReqwestClient::new();
 
-        let result = gather_input_units(&inputs, &client, false).await;
+        let result = gather_input_units(&inputs, &client, false, 5).await; // Added concurrency (default 5)
 
         // Should succeed overall, but only contain units for valid inputs
         assert!(result.is_ok());
         let units = result.unwrap();
         assert_eq!(units.len(), 2); // Only the valid file and valid URL
-        assert!(units.iter().any(|u| u.identifier.contains(file1.path().file_name().unwrap().to_str().unwrap()) && u.data == b"valid_content\n")); // Add newline
-        assert!(units.iter().any(|u| u.identifier == url1 && u.data == b"valid_url_content"));
+        assert!(units.iter().any(|u| {
+            u.identifier
+                .contains(file1.path().file_name().unwrap().to_str().unwrap())
+                && u.data == b"valid_content\n"
+        })); // Add newline
+        assert!(
+            units
+                .iter()
+                .any(|u| u.identifier == url1 && u.data == b"valid_url_content")
+        );
         // We can't easily assert stderr here, but errors for the invalid inputs should have been printed
     }
 

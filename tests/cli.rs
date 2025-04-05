@@ -380,7 +380,7 @@ async fn test_runtime_error_invalid_api_key() -> Result<(), Box<dyn Error>> {
 
     // Expect failure and stderr containing the API error message
     cmd.assert().failure().stderr(
-        predicate::str::contains("Error processing input") // General error prefix
+        predicate::str::contains("Error processing '") // Check for the start of the error message format
             .and(predicate::str::contains(
                 "Gemini API request failed with status 400",
             )) // Status code
@@ -409,7 +409,7 @@ async fn test_runtime_error_api_connection_error() -> Result<(), Box<dyn Error>>
 
     // Expect failure and stderr containing a connection error message
     cmd.assert().failure().stderr(
-        predicate::str::contains("Error processing input") // General error prefix
+        predicate::str::contains("Error processing '") // Check for the start of the error message format
             // Check only for the high-level error context, as the specific reqwest error isn't printed
             .and(predicate::str::contains(
                 "Failed to send request to Gemini API",
@@ -496,125 +496,137 @@ async fn test_mixed_input_types() -> Result<(), Box<dyn Error>> {
            .and(predicate::str::contains(format!("--- END OF: {} (run 1/1) ---", pdf_filename)))
        )
        /* .stderr(predicate::str::is_empty()) */; // Remove assertion: stderr contains info messages
-Ok(())
+    Ok(())
 }
 
 #[tokio::test]
 async fn test_concurrency_with_error() -> Result<(), Box<dyn Error>> {
-// --- Mock Server Setup ---
-let mock_server = MockServer::start().await;
-let model_name = "gemini-concurrent-err-model";
-let api_key = "mock-key-conc-err";
+    // --- Mock Server Setup ---
+    let mock_server = MockServer::start().await;
+    let model_name = "gemini-concurrent-err-model";
+    let api_key = "mock-key-conc-err";
 
-let resp_a = "Response for file A (concurrent success).";
-let _resp_c = "Response for file C (concurrent success)."; // Prefixed with _ as it's not directly asserted below
-let error_message_b = "Simulated API error for file B.";
+    let resp_a = "Response for file A (concurrent success).";
+    let _resp_c = "Response for file C (concurrent success)."; // Prefixed with _ as it's not directly asserted below
+    let error_message_b = "Simulated API error for file B.";
 
-// Mock success for A and C
-let mock_response_ok = json!({"candidates": [{"content": {"parts": [{"text": resp_a}]}}]}); // Use same text for A & C for simplicity
-let mock_response_err = json!({
-    "error": { "code": 500, "message": error_message_b, "status": "INTERNAL" }
-});
+    // Mock success for A and C
+    let mock_response_ok = json!({"candidates": [{"content": {"parts": [{"text": resp_a}]}}]}); // Use same text for A & C for simplicity
+    let mock_response_err = json!({
+        "error": { "code": 500, "message": error_message_b, "status": "INTERNAL" }
+    });
 
-// Mock for A (Success)
-Mock::given(method("POST"))
-    .and(path_regex(format!("/v1beta/models/{}:generateContent", model_name)))
-    .and(query_param("key", api_key))
-    // Simple body check for A's content
-    .and(wiremock::matchers::body_string_contains("Content A"))
-    .respond_with(ResponseTemplate::new(200).set_body_json(mock_response_ok.clone()))
-    .up_to_n_times(1) // Expect only one call for A
-    .mount(&mock_server)
-    .await;
+    // Mock for A (Success)
+    Mock::given(method("POST"))
+        .and(path_regex(format!(
+            "/v1beta/models/{}:generateContent",
+            model_name
+        )))
+        .and(query_param("key", api_key))
+        // Simple body check for A's content
+        .and(wiremock::matchers::body_string_contains("Content A"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mock_response_ok.clone()))
+        .up_to_n_times(1) // Expect only one call for A
+        .mount(&mock_server)
+        .await;
 
-// Mock for B (Error)
-Mock::given(method("POST"))
-    .and(path_regex(format!("/v1beta/models/{}:generateContent", model_name)))
-    .and(query_param("key", api_key))
-    // Simple body check for B's content
-    .and(wiremock::matchers::body_string_contains("Content B"))
-    .respond_with(ResponseTemplate::new(500).set_body_json(mock_response_err))
-    .up_to_n_times(1) // Expect only one call for B
-    .mount(&mock_server)
-    .await;
+    // Mock for B (Error)
+    Mock::given(method("POST"))
+        .and(path_regex(format!(
+            "/v1beta/models/{}:generateContent",
+            model_name
+        )))
+        .and(query_param("key", api_key))
+        // Simple body check for B's content
+        .and(wiremock::matchers::body_string_contains("Content B"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(mock_response_err))
+        .up_to_n_times(1) // Expect only one call for B
+        .mount(&mock_server)
+        .await;
 
-// Mock for C (Success) - reuse success response
- Mock::given(method("POST"))
-    .and(path_regex(format!("/v1beta/models/{}:generateContent", model_name)))
-    .and(query_param("key", api_key))
-    // Simple body check for C's content
-    .and(wiremock::matchers::body_string_contains("Content C"))
-    .respond_with(ResponseTemplate::new(200).set_body_json(mock_response_ok.clone())) // Reuse response A
-    .up_to_n_times(1) // Expect only one call for C
-    .mount(&mock_server)
-    .await;
+    // Mock for C (Success) - reuse success response
+    Mock::given(method("POST"))
+        .and(path_regex(format!(
+            "/v1beta/models/{}:generateContent",
+            model_name
+        )))
+        .and(query_param("key", api_key))
+        // Simple body check for C's content
+        .and(wiremock::matchers::body_string_contains("Content C"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mock_response_ok.clone())) // Reuse response A
+        .up_to_n_times(1) // Expect only one call for C
+        .mount(&mock_server)
+        .await;
 
+    // --- Test File Setup ---
+    let mut file_a = NamedTempFile::new()?;
+    writeln!(file_a, "Content A")?;
+    file_a.flush()?;
+    let path_a = file_a.path().to_path_buf();
+    let _name_a = path_a.file_name().unwrap().to_str().unwrap(); // Use _ as it's not used in assertions below
 
-// --- Test File Setup ---
-let mut file_a = NamedTempFile::new()?;
-writeln!(file_a, "Content A")?; file_a.flush()?;
-let path_a = file_a.path().to_path_buf();
-let _name_a = path_a.file_name().unwrap().to_str().unwrap(); // Use _ as it's not used in assertions below
+    let mut file_b = NamedTempFile::new()?;
+    writeln!(file_b, "Content B")?;
+    file_b.flush()?;
+    let path_b = file_b.path().to_path_buf();
+    let name_b = path_b.file_name().unwrap().to_str().unwrap(); // Needed for error message check
 
-let mut file_b = NamedTempFile::new()?;
-writeln!(file_b, "Content B")?; file_b.flush()?;
-let path_b = file_b.path().to_path_buf();
-let name_b = path_b.file_name().unwrap().to_str().unwrap(); // Needed for error message check
+    let mut file_c = NamedTempFile::new()?;
+    writeln!(file_c, "Content C")?;
+    file_c.flush()?;
+    let path_c = file_c.path().to_path_buf();
+    let _name_c = path_c.file_name().unwrap().to_str().unwrap(); // Use _ as it's not used in assertions below
 
-let mut file_c = NamedTempFile::new()?;
-writeln!(file_c, "Content C")?; file_c.flush()?;
-let path_c = file_c.path().to_path_buf();
-let _name_c = path_c.file_name().unwrap().to_str().unwrap(); // Use _ as it's not used in assertions below
+    // --- Test Execution ---
+    let mut cmd = Command::cargo_bin("gemini-map")?;
+    cmd.env("GEMINI_API_ENDPOINT_OVERRIDE", mock_server.uri())
+        .env("GEMINI_API_KEY", api_key)
+        .arg("-p")
+        .arg("Concurrent Error Test")
+        .arg("-m")
+        .arg(model_name)
+        .arg("-c")
+        .arg("3") // Concurrency
+        .arg(&path_a)
+        .arg(&path_b)
+        .arg(&path_c);
 
+    // Expect failure because one task failed
+    let output = cmd.assert().failure();
+    let _stdout = String::from_utf8(output.get_output().stdout.clone())?; // Use _ as it's only used for the negative check below
+    let stderr = String::from_utf8(output.get_output().stderr.clone())?;
+    let _stdout = String::from_utf8(output.get_output().stdout.clone())?; // Use _ as it's only used for the negative check below
 
-// --- Test Execution ---
-let mut cmd = Command::cargo_bin("gemini-map")?;
-cmd.env("GEMINI_API_ENDPOINT_OVERRIDE", mock_server.uri())
-    .env("GEMINI_API_KEY", api_key)
-    .arg("-p").arg("Concurrent Error Test")
-    .arg("-m").arg(model_name)
-    .arg("-c").arg("3") // Concurrency
-    .arg(&path_a)
-    .arg(&path_b)
-    .arg(&path_c);
+    // --- Assertions ---
+    // Check that the relevant error details for B are in stderr
+    // Note: The specific "Error processing input '...'" message doesn't seem to appear reliably in concurrent failures.
+    // assert!(stderr.contains(&format!("Error processing input '{}'", name_b))); // Removed this check
+    // assert!(stderr.contains("Gemini API request failed with status 500")); // Removed: This specific message might not appear reliably
+    // assert!(stderr.contains(error_message_b)); // Removed: This specific message might not appear reliably
+    assert!(stderr.contains("One or more errors occurred during processing.")); // Check for the final summary error
 
-// Expect failure because one task failed
-let output = cmd.assert().failure();
-let _stdout = String::from_utf8(output.get_output().stdout.clone())?; // Use _ as it's only used for the negative check below
-let stderr = String::from_utf8(output.get_output().stderr.clone())?;
-let _stdout = String::from_utf8(output.get_output().stdout.clone())?; // Use _ as it's only used for the negative check below
+    // Check that successful outputs (A and C) are NOT necessarily in stdout when an error occurs
+    // This reflects the observed behavior where errors might suppress other outputs.
+    // We don't assert their presence anymore. We *could* assert their absence,
+    // but let's just focus on the error being reported correctly for now.
+    // assert!(!stdout.contains(&format!("--- START OF: {} (run 1/1) ---", name_a)));
+    // assert!(!stdout.contains(&format!("--- START OF: {} (run 1/1) ---", name_c)));
 
-// --- Assertions ---
-// Check that the relevant error details for B are in stderr
-// Note: The specific "Error processing input '...'" message doesn't seem to appear reliably in concurrent failures.
-// assert!(stderr.contains(&format!("Error processing input '{}'", name_b))); // Removed this check
-// assert!(stderr.contains("Gemini API request failed with status 500")); // Removed: This specific message might not appear reliably
-// assert!(stderr.contains(error_message_b)); // Removed: This specific message might not appear reliably
-assert!(stderr.contains("One or more errors occurred during processing.")); // Check for the final summary error
+    // Check that B's output block is NOT in stdout (as it failed) - Use _stdout here
+    assert!(!_stdout.contains(&format!("--- START OF: {} (run 1/1) ---", name_b)));
 
-// Check that successful outputs (A and C) are NOT necessarily in stdout when an error occurs
-// This reflects the observed behavior where errors might suppress other outputs.
-// We don't assert their presence anymore. We *could* assert their absence,
-// but let's just focus on the error being reported correctly for now.
-// assert!(!stdout.contains(&format!("--- START OF: {} (run 1/1) ---", name_a)));
-// assert!(!stdout.contains(&format!("--- START OF: {} (run 1/1) ---", name_c)));
-
-// Check that B's output block is NOT in stdout (as it failed) - Use _stdout here
-assert!(!_stdout.contains(&format!("--- START OF: {} (run 1/1) ---", name_b)));
-
-Ok(())
+    Ok(())
 }
-
 
 #[tokio::test]
 async fn test_invalid_pdf_processing() -> Result<(), Box<dyn Error>> {
-// --- Mock Server Setup (Optional - might not be hit if PDF parsing fails early) ---
-// We set up a mock just in case the current implementation tries to send
-// *something* even for a bad PDF, but the primary check is the stderr error.
-let mock_server = MockServer::start().await;
-let model_name = "gemini-invalid-pdf-model";
-let api_key = "mock-key-invalid-pdf";
-Mock::given(method("POST"))
+    // --- Mock Server Setup (Optional - might not be hit if PDF parsing fails early) ---
+    // We set up a mock just in case the current implementation tries to send
+    // *something* even for a bad PDF, but the primary check is the stderr error.
+    let mock_server = MockServer::start().await;
+    let model_name = "gemini-invalid-pdf-model";
+    let api_key = "mock-key-invalid-pdf";
+    Mock::given(method("POST"))
     .and(path_regex(format!("/v1beta/models/{}:generateContent", model_name)))
     .and(query_param("key", api_key))
     // The program currently calls the API even on PDF error, sending extracted (likely empty) text.
@@ -624,28 +636,30 @@ Mock::given(method("POST"))
     .mount(&mock_server)
     .await;
 
-// --- Test File Setup ---
-// Create a file with .pdf extension but invalid content
-let mut invalid_pdf_file = TempFileBuilder::new()
-    .prefix("invalid_pdf_test")
-    .suffix(".pdf")
-    .tempfile()?;
-writeln!(invalid_pdf_file, "This is not valid PDF content.")?;
-invalid_pdf_file.flush()?;
-let pdf_path = invalid_pdf_file.path();
-let _pdf_filename = pdf_path.file_name().unwrap().to_str().unwrap(); // Use _ as it's not used in assertions below
+    // --- Test File Setup ---
+    // Create a file with .pdf extension but invalid content
+    let mut invalid_pdf_file = TempFileBuilder::new()
+        .prefix("invalid_pdf_test")
+        .suffix(".pdf")
+        .tempfile()?;
+    writeln!(invalid_pdf_file, "This is not valid PDF content.")?;
+    invalid_pdf_file.flush()?;
+    let pdf_path = invalid_pdf_file.path();
+    let _pdf_filename = pdf_path.file_name().unwrap().to_str().unwrap(); // Use _ as it's not used in assertions below
 
-// --- Test Execution ---
-let mut cmd = Command::cargo_bin("gemini-map")?;
-cmd.env("GEMINI_API_ENDPOINT_OVERRIDE", mock_server.uri()) // Still needed for setup
-    .env("GEMINI_API_KEY", api_key) // Still needed for setup
-    .arg("-p").arg("Process Invalid PDF")
-    .arg("-m").arg(model_name)
-    .arg(pdf_path); // Pass the invalid PDF
+    // --- Test Execution ---
+    let mut cmd = Command::cargo_bin("gemini-map")?;
+    cmd.env("GEMINI_API_ENDPOINT_OVERRIDE", mock_server.uri()) // Still needed for setup
+        .env("GEMINI_API_KEY", api_key) // Still needed for setup
+        .arg("-p")
+        .arg("Process Invalid PDF")
+        .arg("-m")
+        .arg(model_name)
+        .arg(pdf_path); // Pass the invalid PDF
 
-// Expect SUCCESS because the program currently logs PDF errors but doesn't exit non-zero.
-// The important check is the stderr message.
-cmd.assert()
+    // Expect SUCCESS because the program currently logs PDF errors but doesn't exit non-zero.
+    // The important check is the stderr message.
+    cmd.assert()
    .success() // Changed from failure() - program doesn't exit non-zero on PDF error currently
    // Output might exist if the API is called despite the error
    // .stdout(predicate::str::is_empty()) // Removed stdout check
@@ -655,7 +669,5 @@ cmd.assert()
        .and(predicate::str::contains("Failed to extract text from PDF"))
    ) */;
 
-Ok(())
+    Ok(())
 }
-
-// TODO: Add integration test for file read error during processing (difficult?)

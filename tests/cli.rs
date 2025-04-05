@@ -1,7 +1,7 @@
 // Integration tests for the llm-map CLI
 
-use assert_cmd::Command; // Run programs
-use predicates::prelude::*; // Used for writing assertions
+use assert_cmd::Command;
+use predicates::prelude::*;
 use serde_json::json;
 use std::{error::Error, io::Write, time::Duration}; // Added Duration
 use tempfile::NamedTempFile;
@@ -10,7 +10,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[test]
 fn test_runs_successfully_with_args() -> Result<(), Box<dyn Error>> {
-    // Create dummy files
     let file1 = NamedTempFile::new()?;
     let file2 = NamedTempFile::new()?;
 
@@ -73,7 +72,6 @@ fn test_missing_files_arg() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_reads_file_content() -> Result<(), Box<dyn Error>> {
-    // Create a temp file with known content
     let mut file = NamedTempFile::new()?;
     let file_content = "Hello, test file!\nLine 2.";
     writeln!(file, "{}", file_content)?;
@@ -123,13 +121,13 @@ async fn test_api_call_with_mock() -> Result<(), Box<dyn Error>> {
         "index": 0,
         "safetyRatings": [
             {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "probability": "NEGLIGIBLE"},
-            // ... other safety ratings
+            // ... other safety ratings (structure required by API)
         ]
       }],
       "promptFeedback": {
          "safetyRatings": [
             {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "probability": "NEGLIGIBLE"},
-            // ... other safety ratings
+            // ... other safety ratings (structure required by API)
          ]
       }
     });
@@ -166,9 +164,10 @@ async fn test_api_call_with_mock() -> Result<(), Box<dyn Error>> {
        .success()
        .stdout(
            predicate::str::contains(format!("--- START FILE: {} ---", filename))
-           .and(predicate::str::contains(&format!("| {}", mock_api_response_text))) // Check for *formatted* mocked response
+           // Remove the explicit '&' as contains likely takes &str directly
+           .and(predicate::str::contains(format!("| {}", mock_api_response_text))) // Check for formatted mocked response
            .and(predicate::str::contains(format!("--- END FILE: {} ---", filename)))
-       ); // End of stdout predicate chain
+       );
        // .stderr(predicate::str::is_empty()); // Expect empty stderr on success
 
     Ok(())

@@ -19,9 +19,9 @@ mime_guess = "2.0" # For guessing MIME types
 base64 = "0.22" # For base64 encoding
 mime = "0.3" # Added for mime constants
 url = "2.5" # Added for URL parsing
-# lopdf = "0.31" # No longer needed for page splitting via text extraction
-pdfium-render = "0.8" # Added for rendering PDF pages to images
-image = { version = "0.25", default-features = false, features = ["png"] } # Added for PNG encoding
+lopdf = "0.31.0" # Use lopdf for creating single-page PDFs
+# pdfium-render = "0.8" # Removed, no longer rendering pages to images
+# image = { version = "0.25", default-features = false, features = ["png"] } # Removed, no longer encoding PNGs
 
 [dev-dependencies]
 assert_cmd = "2.0"
